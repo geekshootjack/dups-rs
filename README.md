@@ -15,7 +15,7 @@ Append xxHash3-64 checksums to media filenames so that two files can never colli
 
 ### Download pre-built binaries
 
-Get the latest releases from [GitHub Releases](https://github.com/geekshootjack/dups/releases)
+Get the latest releases from [GitHub Releases](https://github.com/geekshootjack/dups-rs/releases)
 
 - `dups-windows-x86_64.exe` — Windows
 - `dups-macos-x86_64` — macOS Intel
