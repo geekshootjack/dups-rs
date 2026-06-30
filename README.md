@@ -2,6 +2,15 @@
 
 Append xxHash3-64 checksums to media filenames so that two files can never collide by name. Same name implies same content by construction.
 
+In data management, backups, and post-production workflows, **filename collisions** are common: multiple files with different content share the same filename. This leads to two critical problems:
+- Assets overwrite each other, causing data loss
+- Post-production software links to the wrong asset
+
+Our solution: append a 16-character xxHash3-64 hash value to the filename. Since this hash is derived directly from file content, it guarantees:
+
+- **Different content** → Different hash → Different filename → Links never point to the wrong asset
+- **Same content** → Same hash → Same filename → Genuine duplicates, linking to either is fine
+
 ## Features
 
 - **Cross-platform** — Windows, macOS (Intel & ARM), Linux
@@ -36,13 +45,13 @@ cargo build --release
 
 ```bash
 # 1. Preview what would be renamed
-cargo run -q -- /path/to/media
+dups /path/to/media
 
 # 2. If it looks good, execute
-cargo run -q -- /path/to/media --apply
+dups /path/to/media --apply
 
 # 3. If you need to undo
-cargo run -q -- undo dups-applied-XXXXXX.csv
+dups undo dups-applied-XXXXXX.csv
 ```
 
 ### Options
@@ -74,7 +83,7 @@ cargo run -q -- undo dups-applied-XXXXXX.csv
 ## Example
 
 ```
-$ cargo run -q -- /media/videos
+$ dups /media/videos
 
 ======================================================================
 摘要 / Summary
@@ -93,7 +102,7 @@ $ cargo run -q -- /media/videos
 Then with `--apply`:
 
 ```
-$ cargo run -q -- /media/videos --apply
+$ dups /media/videos --apply
 
 开始执行 12 个重命名...
   [OK] video1.mp4
@@ -111,7 +120,7 @@ $ cargo run -q -- /media/videos --apply
 Next steps:
   1. 检查结果是否满意
   2. 如需撤销所有改名，运行:
-     cargo run -q -- undo dups-applied-20260630-153526.csv
+     dups undo dups-applied-20260630-153526.csv
   3. 详细日志见: dups-applied-20260630-153526.csv
 ```
 

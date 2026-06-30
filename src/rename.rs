@@ -492,7 +492,7 @@ impl RenameOperation {
             println!("\nNext steps:");
             println!("  1. 检查结果是否满意");
             println!("  2. 如需撤销所有改名，运行:");
-            println!("     cargo run -q -- undo {}", log_file);
+            println!("     dups undo {}", log_file);
             println!("  3. 详细日志见: {}", log_file);
         }
 
