@@ -538,7 +538,7 @@ fn verify_hash(path: &Path, expected: &str) -> Result<()> {
 
     let mut hasher = Xxh3::new();
     let mut file = std::fs::File::open(path)?;
-    let mut buffer = [0u8; 16 * 1024 * 1024]; // 16MB chunks
+    let mut buffer = vec![0u8; 16 * 1024 * 1024]; // 16MB chunks
 
     use std::io::Read;
     loop {
