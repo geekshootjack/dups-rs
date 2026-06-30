@@ -421,14 +421,14 @@ impl RenameOperation {
                 match std::fs::rename(&action.src, dst) {
                     Ok(_) => {
                         success += 1;
-                        println!("  ✓ {}", action.src.file_name().unwrap_or_default().to_string_lossy());
+                        println!("  [OK] {}", action.src.file_name().unwrap_or_default().to_string_lossy());
                         // Mark as successfully renamed
                         report.actions[idx].status = "renamed".to_string();
                     }
                     Err(e) => {
                         failed += 1;
                         let error_msg = e.to_string();
-                        println!("  ✗ {}: {}", action.src.file_name().unwrap_or_default().to_string_lossy(), e);
+                        println!("  [ERROR] {}: {}", action.src.file_name().unwrap_or_default().to_string_lossy(), e);
                         // Mark as error with error details
                         report.actions[idx].status = "error".to_string();
                         report.actions[idx].note = format!("rename failed: {}", error_msg);
@@ -457,18 +457,18 @@ impl RenameOperation {
         println!("\n{}", "=".repeat(70));
         println!("执行完成");
         println!("{}", "-".repeat(70));
-        println!("✓ 成功改名: {} 个", renamed);
+        println!("[OK] 成功改名: {} 个", renamed);
         if errors > 0 {
-            println!("✗ 改名失败: {} 个", errors);
+            println!("[ERROR] 改名失败: {} 个", errors);
         }
         println!("{}", "=".repeat(70));
 
         if renamed > 0 {
-            println!("\n💡 下一步:");
-            println!("  • 检查结果是否满意");
-            println!("  • 如需撤销所有改名，运行:");
-            println!("    cargo run -q -- undo {}", log_file);
-            println!("  • 详细日志见: {}", log_file);
+            println!("\nNext steps:");
+            println!("  1. 检查结果是否满意");
+            println!("  2. 如需撤销所有改名，运行:");
+            println!("     cargo run -q -- undo {}", log_file);
+            println!("  3. 详细日志见: {}", log_file);
         }
 
         Ok(())

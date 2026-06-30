@@ -154,7 +154,7 @@ pub fn undo(log_path: &Path) -> Result<()> {
         if old_path.exists() {
             fail += 1;
             journal.record("refuse", "", &old, &new, "original name occupied")?;
-            println!("  ✗ 拒绝(原名已被占用): {}", old);
+            println!("  [SKIP] 拒绝(原名已被占用): {}", old);
             continue;
         }
 
@@ -166,7 +166,7 @@ pub fn undo(log_path: &Path) -> Result<()> {
             Err(e) => {
                 fail += 1;
                 journal.record("error", "", &old, &new, &e.to_string())?;
-                println!("  ✗ {}: {}", new, e);
+                println!("  [ERROR] {}: {}", new, e);
             }
         }
     }
