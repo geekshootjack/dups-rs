@@ -95,6 +95,9 @@ impl RenameOperation {
             let log_file = format!("dups-applied-{}.csv", now);
             self.write_csv_log(&report, &log_file, true)?;
             println!("\n日志已写出: {}", log_file);
+
+            // Print summary and next steps
+            self.print_apply_summary(&report, &log_file)?;
         }
 
         Ok(())
@@ -435,6 +438,38 @@ impl RenameOperation {
         }
 
         println!("重命名完成: 成功 {}, 失败 {}", success, failed);
+
+        Ok(())
+    }
+
+    fn print_apply_summary(&self, report: &Report, log_file: &str) -> Result<()> {
+        let renamed = report
+            .actions
+            .iter()
+            .filter(|a| a.status == "renamed")
+            .count();
+        let errors = report
+            .actions
+            .iter()
+            .filter(|a| a.status == "error")
+            .count();
+
+        println!("\n{}", "=".repeat(70));
+        println!("执行完成");
+        println!("{}", "-".repeat(70));
+        println!("✓ 成功改名: {} 个", renamed);
+        if errors > 0 {
+            println!("✗ 改名失败: {} 个", errors);
+        }
+        println!("{}", "=".repeat(70));
+
+        if renamed > 0 {
+            println!("\n💡 下一步:");
+            println!("  • 检查结果是否满意");
+            println!("  • 如需撤销所有改名，运行:");
+            println!("    cargo run -q -- undo {}", log_file);
+            println!("  • 详细日志见: {}", log_file);
+        }
 
         Ok(())
     }
