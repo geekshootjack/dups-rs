@@ -104,7 +104,8 @@ pub fn undo(log_path: &Path) -> Result<()> {
 
         // Format: timestamp, status, hash, old_path, new_path, note
         let status = record.get(1).unwrap_or(&"");
-        if status != "rename" {
+        // Only undo files that were actually renamed (status == "renamed")
+        if status != "renamed" {
             continue;
         }
 

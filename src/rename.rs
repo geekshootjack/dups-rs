@@ -67,22 +67,18 @@ impl RenameOperation {
         }
 
         // Build the plan
-        let report = self.build_plan(&entries)?;
+        let mut report = self.build_plan(&entries)?;
 
         // Print report
         self.print_report(&report)?;
 
-        // Write CSV log
-        let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let log_file = if self.dry_run {
-            format!("dups-dryrun-{}.csv", now)
-        } else {
-            format!("dups-applied-{}.csv", now)
-        };
-        self.write_csv_log(&report, &log_file, !self.dry_run)?;
-        println!("\n日志已写出: {}", log_file);
-
         if self.dry_run {
+            // Write dry-run report
+            let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let log_file = format!("dups-dryrun-{}.csv", now);
+            self.write_csv_log(&report, &log_file, false)?;
+            println!("\n日志已写出: {}", log_file);
+
             println!("\n*** 预演模式 (DRY-RUN) *** 未改动任何文件。");
             let to_rename = report
                 .actions
@@ -91,14 +87,14 @@ impl RenameOperation {
                 .count();
             println!("计划改名 {} 个。确认无误后加 --apply 执行。", to_rename);
         } else {
-            // Execute renames
-            self.apply_renames(&report)?;
+            // Execute renames and update report with actual results
+            self.apply_renames(&mut report)?;
 
-            // Also write final report CSV after apply (with correct encoding)
+            // Write applied report with actual execution results
             let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            let final_csv = format!("dups-result-{}.csv", now);
-            self.write_csv_log(&report, &final_csv, true)?;
-            println!("最终报告已写出: {}", final_csv);
+            let log_file = format!("dups-applied-{}.csv", now);
+            self.write_csv_log(&report, &log_file, true)?;
+            println!("\n日志已写出: {}", log_file);
         }
 
         Ok(())
@@ -397,52 +393,48 @@ impl RenameOperation {
         Ok(())
     }
 
-    fn apply_renames(&self, report: &Report) -> Result<()> {
-        let to_rename: Vec<_> = report
+    fn apply_renames(&self, report: &mut Report) -> Result<()> {
+        let to_rename_indices: Vec<_> = report
             .actions
             .iter()
-            .filter(|a| a.status == "rename")
+            .enumerate()
+            .filter(|(_, a)| a.status == "rename")
+            .map(|(i, _)| i)
             .collect();
 
-        if to_rename.is_empty() {
+        if to_rename_indices.is_empty() {
             println!("没有需要改名的文件。");
             return Ok(());
         }
 
-        println!("开始执行 {} 个重命名...", to_rename.len());
-
-        let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let log_path = std::env::current_dir()?
-            .join(format!("rehash-applied-{}.csv", now));
-
-        let mut journal = Journal::new(&log_path)?;
+        println!("开始执行 {} 个重命名...", to_rename_indices.len());
 
         let mut success = 0;
         let mut failed = 0;
 
-        for action in &to_rename {
+        for idx in to_rename_indices {
+            let action = &report.actions[idx];
             if let Some(dst) = &action.dst {
-                // Record intent before actual rename
-                journal.record("rename", &action.hash, &action.src.to_string_lossy(),
-                              &dst.to_string_lossy(), "")?;
-
                 match std::fs::rename(&action.src, dst) {
                     Ok(_) => {
                         success += 1;
                         println!("  ✓ {}", action.src.file_name().unwrap_or_default().to_string_lossy());
+                        // Mark as successfully renamed
+                        report.actions[idx].status = "renamed".to_string();
                     }
                     Err(e) => {
                         failed += 1;
+                        let error_msg = e.to_string();
                         println!("  ✗ {}: {}", action.src.file_name().unwrap_or_default().to_string_lossy(), e);
-                        journal.record("error", &action.hash, &action.src.to_string_lossy(),
-                                      &dst.to_string_lossy(), &e.to_string())?;
+                        // Mark as error with error details
+                        report.actions[idx].status = "error".to_string();
+                        report.actions[idx].note = format!("rename failed: {}", error_msg);
                     }
                 }
             }
         }
 
         println!("重命名完成: 成功 {}, 失败 {}", success, failed);
-        println!("日志已写出: {}", log_path.display());
 
         Ok(())
     }
