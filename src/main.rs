@@ -30,6 +30,10 @@ struct Cli {
     #[arg(long)]
     update_manifest: bool,
 
+    /// Include all file types, not just videos
+    #[arg(long)]
+    all_files: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -61,6 +65,7 @@ fn main() -> Result<()> {
                 cli.verify,
                 cli.update_manifest,
                 !cli.apply, // dry_run is true when apply is false
+                cli.all_files,
             )?;
 
             operation.execute()?;

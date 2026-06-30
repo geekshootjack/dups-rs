@@ -17,10 +17,13 @@ impl Journal {
 
         let mut writer = BufWriter::new(file);
 
+        // Write UTF-8 BOM for Windows Excel compatibility
+        writer.write_all(&[0xEF, 0xBB, 0xBF])?;
+
         // Write header
         writeln!(
             writer,
-            "timestamp,event,hash,old_path,new_path,note"
+            "timestamp,status,hash,old_path,new_path,note"
         )?;
         writer.flush()?;
 
@@ -43,7 +46,7 @@ impl Journal {
 
     pub fn record(
         &mut self,
-        event: &str,
+        status: &str,
         hash: &str,
         old: &str,
         new: &str,
@@ -53,7 +56,7 @@ impl Journal {
         let line = format!(
             "{},{},{},{},{},{}",
             now,
-            event,
+            status,
             escape_csv(hash),
             escape_csv(old),
             escape_csv(new),
@@ -86,29 +89,27 @@ pub fn undo(log_path: &Path) -> Result<()> {
         return Err(anyhow!("Log not found"));
     }
 
-    // Read all rename pairs from log
-    let content = std::fs::read_to_string(log_path)?;
+    // Read all rename pairs from log using proper CSV parser
+    let file = std::fs::File::open(log_path)?;
+    let mut reader = csv::Reader::from_reader(file);
+
     let mut pairs: Vec<(String, String)> = Vec::new();
     let mut seen_set: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
 
-    for line in content.lines().skip(1) {
-        // Skip header
-        if line.is_empty() {
+    for record in reader.records() {
+        let record = record?;
+        if record.len() < 6 {
             continue;
         }
 
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 5 {
+        // Format: timestamp, status, hash, old_path, new_path, note
+        let status = record.get(1).unwrap_or(&"");
+        if status != "rename" {
             continue;
         }
 
-        let event = parts[1].trim();
-        if event != "rename" {
-            continue;
-        }
-
-        let old = parts[3].trim().trim_matches('"').to_string();
-        let new = parts[4].trim().trim_matches('"').to_string();
+        let old = record.get(3).unwrap_or(&"").to_string();
+        let new = record.get(4).unwrap_or(&"").to_string();
 
         if !old.is_empty() && !new.is_empty() && !seen_set.contains(&(old.clone(), new.clone()))
         {

@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
 pub struct HashEntry {
@@ -18,30 +20,27 @@ impl HashFile {
     pub fn find_in_dir(root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
         let mut found = Vec::new();
 
-        fn search(dir: &Path, pattern: &str, found: &mut Vec<PathBuf>) -> Result<()> {
-            for entry in std::fs::read_dir(dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.is_dir() {
-                    search(&path, pattern, found)?;
-                } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if pattern.ends_with(".xxh3") && name.ends_with(".xxh3") {
-                        // Skip already-renamed copies
-                        if !name.contains("_renamed") {
-                            found.push(path);
-                        }
-                    } else if pattern.ends_with(".xxh") && name.ends_with(".xxh")
-                        && !name.ends_with(".xxh3") {
-                        if !name.contains("_renamed") {
-                            found.push(path);
-                        }
+        for entry in WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if pattern.ends_with(".xxh3") && name.ends_with(".xxh3") {
+                    // Skip already-renamed copies
+                    if !name.contains("_renamed") {
+                        found.push(path.to_path_buf());
+                    }
+                } else if pattern.ends_with(".xxh") && name.ends_with(".xxh")
+                    && !name.ends_with(".xxh3")
+                {
+                    if !name.contains("_renamed") {
+                        found.push(path.to_path_buf());
                     }
                 }
             }
-            Ok(())
         }
 
-        search(root, pattern, &mut found)?;
         found.sort();
         Ok(found)
     }
@@ -54,6 +53,9 @@ impl HashFile {
         let base = manifest_path.parent().ok_or_else(|| anyhow!("No parent dir"))?;
         let mut entries = Vec::new();
 
+        // Regex to match: 16 hex chars, space, marker (*, or space), then rest is path
+        let line_re = Regex::new(r"^([0-9A-Fa-f]{16})[ ]([* ])(.+)$")?;
+
         for line in content.lines() {
             let line = line.trim_end_matches('\n').trim_end_matches('\r');
 
@@ -62,15 +64,13 @@ impl HashFile {
                 continue;
             }
 
-            // Parse line: HASH MARKER RELPATH
-            let parts: Vec<&str> = line.splitn(3, ' ').collect();
-            if parts.len() != 3 {
+            let Some(caps) = line_re.captures(line) else {
                 continue; // Skip unparseable lines
-            }
+            };
 
-            let hash = parts[0].to_uppercase();
-            let _marker = parts[1]; // "*" for binary, " " for text
-            let rel_path_str = parts[2];
+            let hash = caps[1].to_uppercase();
+            let _marker = &caps[2]; // "*" for binary, " " for text
+            let rel_path_str = &caps[3];
 
             // Convert Windows paths to current OS
             let abs_path = if cfg!(windows) {

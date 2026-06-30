@@ -23,6 +23,7 @@ pub struct Action {
 pub struct Report {
     pub actions: Vec<Action>,
     pub orphans: Vec<PathBuf>,
+    pub warnings: Vec<String>,
 }
 
 pub struct RenameOperation {
@@ -31,6 +32,7 @@ pub struct RenameOperation {
     verify: bool,
     update_manifest: bool,
     dry_run: bool,
+    all_files: bool,
 }
 
 impl RenameOperation {
@@ -40,6 +42,7 @@ impl RenameOperation {
         verify: bool,
         update_manifest: bool,
         dry_run: bool,
+        all_files: bool,
     ) -> Result<Self> {
         if !path.exists() || !path.is_dir() {
             return Err(anyhow!("Path does not exist or is not a directory: {}", path.display()));
@@ -51,6 +54,7 @@ impl RenameOperation {
             verify,
             update_manifest,
             dry_run,
+            all_files,
         })
     }
 
@@ -68,6 +72,16 @@ impl RenameOperation {
         // Print report
         self.print_report(&report)?;
 
+        // Write CSV log
+        let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let log_file = if self.dry_run {
+            format!("dups-dryrun-{}.csv", now)
+        } else {
+            format!("dups-applied-{}.csv", now)
+        };
+        self.write_csv_log(&report, &log_file, !self.dry_run)?;
+        println!("\n日志已写出: {}", log_file);
+
         if self.dry_run {
             println!("\n*** 预演模式 (DRY-RUN) *** 未改动任何文件。");
             let to_rename = report
@@ -79,6 +93,12 @@ impl RenameOperation {
         } else {
             // Execute renames
             self.apply_renames(&report)?;
+
+            // Also write final report CSV after apply (with correct encoding)
+            let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let final_csv = format!("dups-result-{}.csv", now);
+            self.write_csv_log(&report, &final_csv, true)?;
+            println!("最终报告已写出: {}", final_csv);
         }
 
         Ok(())
@@ -107,6 +127,7 @@ impl RenameOperation {
         let mut report = Report {
             actions: Vec::new(),
             orphans: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let mut seen_src: HashMap<String, HashEntry> = HashMap::new();
@@ -118,6 +139,17 @@ impl RenameOperation {
             let key = entry.abs_path.to_string_lossy().to_lowercase();
             if let Some(prev) = seen_src.get(&key) {
                 if prev.hash != entry.hash {
+                    let warning = format!(
+                        "Warning: {} listed with two different hashes:\n  manifest 1: {} (from {})\n  manifest 2: {} (from {})",
+                        entry.abs_path.display(),
+                        prev.hash,
+                        prev.manifest_path.display(),
+                        entry.hash,
+                        entry.manifest_path.display()
+                    );
+                    report.warnings.push(warning.clone());
+                    println!("{}", warning);
+
                     report.actions.push(Action {
                         src: entry.abs_path.clone(),
                         dst: None,
@@ -139,8 +171,20 @@ impl RenameOperation {
         for entry in seen_src.values() {
             let src = &entry.abs_path;
 
-            // Check if it's a video
-            if !is_video(src, &video_exts) {
+            // Check if it's a system file to exclude
+            if is_system_file(src) {
+                report.actions.push(Action {
+                    src: src.clone(),
+                    dst: None,
+                    hash: entry.hash.clone(),
+                    status: "not-video".to_string(),
+                    note: "system file (excluded)".to_string(),
+                });
+                continue;
+            }
+
+            // Check if it's a video (unless --all-files is set)
+            if !self.all_files && !is_video(src, &video_exts) {
                 report.actions.push(Action {
                     src: src.clone(),
                     dst: None,
@@ -177,12 +221,16 @@ impl RenameOperation {
                         note: "source already renamed in a prior run".to_string(),
                     });
                 } else {
+                    let note = format!(
+                        "listed in manifest but not found on disk (checked: {})",
+                        src.display()
+                    );
                     report.actions.push(Action {
                         src: src.clone(),
                         dst: None,
                         hash: entry.hash.clone(),
                         status: "missing".to_string(),
-                        note: "listed in manifest but not found on disk".to_string(),
+                        note,
                     });
                 }
                 continue;
@@ -289,6 +337,66 @@ impl RenameOperation {
         Ok(())
     }
 
+    fn write_csv_log(&self, report: &Report, filename: &str, applied: bool) -> Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+
+        let mut file = File::create(filename)?;
+
+        // Write UTF-8 BOM for Windows compatibility
+        file.write_all(&[0xEF, 0xBB, 0xBF])?;
+
+        // Write header
+        writeln!(file, "timestamp,status,hash,old_path,new_path,note")?;
+
+        let now = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+
+        // Write each action
+        for action in &report.actions {
+            let old_path = action.src.to_string_lossy();
+            let new_path = action.dst.as_ref().map(|p| p.to_string_lossy()).unwrap_or_default();
+
+            writeln!(
+                file,
+                "{},{},{},{},{},{}",
+                now,
+                action.status,
+                action.hash,
+                escape_csv_value(&old_path),
+                escape_csv_value(&new_path),
+                escape_csv_value(&action.note)
+            )?;
+        }
+
+        // Write orphans
+        for orphan in &report.orphans {
+            writeln!(
+                file,
+                "{},{},{},{},{}",
+                now,
+                "orphan",
+                "",
+                escape_csv_value(&orphan.to_string_lossy()),
+                "no hash in any manifest"
+            )?;
+        }
+
+        // Write warnings as separate rows
+        for warning in &report.warnings {
+            writeln!(
+                file,
+                "{},{},{},{},{}",
+                now,
+                "warning",
+                "",
+                "",
+                escape_csv_value(warning)
+            )?;
+        }
+
+        Ok(())
+    }
+
     fn apply_renames(&self, report: &Report) -> Result<()> {
         let to_rename: Vec<_> = report
             .actions
@@ -344,6 +452,26 @@ impl RenameOperation {
     }
 }
 
+fn is_system_file(path: &Path) -> bool {
+    const SYSTEM_EXTS: &[&str] = &[
+        ".exe", ".dll", ".sys", ".driver", ".scr",
+        ".bat", ".cmd", ".ps1", ".msi",
+        ".lnk", ".url", ".desktop", ".app",
+        ".ini", ".config", ".conf",
+    ];
+
+    if let Some(ext) = path.extension() {
+        if let Some(ext_str) = ext.to_str() {
+            let ext_lower = format!(".{}", ext_str.to_lowercase());
+            SYSTEM_EXTS.iter().any(|&e| e == ext_lower)
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
 fn is_video(path: &Path, exts: &[String]) -> bool {
     if let Some(ext) = path.extension() {
         if let Some(ext_str) = ext.to_str() {
@@ -367,6 +495,14 @@ fn target_for(src: &Path, hash: &str, sep: &str) -> PathBuf {
         }
     } else {
         src.to_path_buf()
+    }
+}
+
+fn escape_csv_value(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
     }
 }
 
