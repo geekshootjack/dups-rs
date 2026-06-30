@@ -12,7 +12,7 @@ impl Journal {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
-            .append(false)
+            .truncate(true)
             .open(path)?;
 
         let mut writer = BufWriter::new(file);
@@ -27,24 +27,13 @@ impl Journal {
         )?;
         writer.flush()?;
 
-        // fsync after header
+        // fsync after header to ensure it's written
         writer.get_ref().sync_all()?;
 
         Ok(Journal { writer })
     }
 
-    pub fn append(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(path)?;
-
-        let writer = BufWriter::new(file);
-        Ok(Journal { writer })
-    }
-
-    pub fn record(
+pub fn record(
         &mut self,
         status: &str,
         hash: &str,
@@ -65,7 +54,8 @@ impl Journal {
         writeln!(self.writer, "{}", line)?;
         self.writer.flush()?;
 
-        // fsync after each write for crash-safety
+        // fsync after each write for write-ahead logging crash-safety
+        // This ensures the record is durably persisted before we execute the operation
         self.writer.get_ref().sync_all()?;
 
         Ok(())

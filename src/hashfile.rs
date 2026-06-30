@@ -11,9 +11,7 @@ pub struct HashEntry {
     pub manifest_path: PathBuf,
 }
 
-pub struct HashFile {
-    entries: Vec<HashEntry>,
-}
+pub struct HashFile;
 
 impl HashFile {
     /// Find hashfiles (.xxh3 or .xxh) in a directory

@@ -30,7 +30,6 @@ pub struct RenameOperation {
     path: PathBuf,
     hashfile: Option<PathBuf>,
     verify: bool,
-    update_manifest: bool,
     dry_run: bool,
     all_files: bool,
 }
@@ -40,7 +39,6 @@ impl RenameOperation {
         path: PathBuf,
         hashfile: Option<PathBuf>,
         verify: bool,
-        update_manifest: bool,
         dry_run: bool,
         all_files: bool,
     ) -> Result<Self> {
@@ -52,7 +50,6 @@ impl RenameOperation {
             path,
             hashfile,
             verify,
-            update_manifest,
             dry_run,
             all_files,
         })
@@ -76,7 +73,7 @@ impl RenameOperation {
             // Write dry-run report
             let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
             let log_file = format!("dups-dryrun-{}.csv", now);
-            self.write_csv_log(&report, &log_file, false)?;
+            self.write_csv_log(&report, &log_file)?;
             println!("\n日志已写出: {}", log_file);
 
             println!("\n*** 预演模式 (DRY-RUN) *** 未改动任何文件。");
@@ -87,13 +84,8 @@ impl RenameOperation {
                 .count();
             println!("计划改名 {} 个。确认无误后加 --apply 执行。", to_rename);
         } else {
-            // Execute renames and update report with actual results
-            self.apply_renames(&mut report)?;
-
-            // Write applied report with actual execution results
-            let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            let log_file = format!("dups-applied-{}.csv", now);
-            self.write_csv_log(&report, &log_file, true)?;
+            // Execute renames with write-ahead logging (logs are created during apply_renames)
+            let log_file = self.apply_renames(&mut report)?;
             println!("\n日志已写出: {}", log_file);
 
             // Print summary and next steps
@@ -336,7 +328,7 @@ impl RenameOperation {
         Ok(())
     }
 
-    fn write_csv_log(&self, report: &Report, filename: &str, applied: bool) -> Result<()> {
+    fn write_csv_log(&self, report: &Report, filename: &str) -> Result<()> {
         use std::fs::File;
         use std::io::Write;
 
@@ -396,7 +388,7 @@ impl RenameOperation {
         Ok(())
     }
 
-    fn apply_renames(&self, report: &mut Report) -> Result<()> {
+    fn apply_renames(&self, report: &mut Report) -> Result<String> {
         let to_rename_indices: Vec<_> = report
             .actions
             .iter()
@@ -407,10 +399,17 @@ impl RenameOperation {
 
         if to_rename_indices.is_empty() {
             println!("没有需要改名的文件。");
-            return Ok(());
+            let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let log_file = format!("dups-applied-{}.csv", now);
+            Journal::new(std::path::Path::new(&log_file))?;
+            return Ok(log_file);
         }
 
         println!("开始执行 {} 个重命名...", to_rename_indices.len());
+
+        let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let log_file = format!("dups-applied-{}.csv", now);
+        let mut journal = Journal::new(std::path::Path::new(&log_file))?;
 
         let mut success = 0;
         let mut failed = 0;
@@ -418,18 +417,44 @@ impl RenameOperation {
         for idx in to_rename_indices {
             let action = &report.actions[idx];
             if let Some(dst) = &action.dst {
+                // Write-ahead logging: record intention BEFORE executing
+                journal.record(
+                    "pending",
+                    &action.hash,
+                    &action.src.to_string_lossy(),
+                    &dst.to_string_lossy(),
+                    "about to rename",
+                )?;
+
+                // Now execute the rename
                 match std::fs::rename(&action.src, dst) {
                     Ok(_) => {
                         success += 1;
                         println!("  [OK] {}", action.src.file_name().unwrap_or_default().to_string_lossy());
-                        // Mark as successfully renamed
+
+                        // Record success immediately after operation
+                        journal.record(
+                            "renamed",
+                            &action.hash,
+                            &action.src.to_string_lossy(),
+                            &dst.to_string_lossy(),
+                            "",
+                        )?;
                         report.actions[idx].status = "renamed".to_string();
                     }
                     Err(e) => {
                         failed += 1;
                         let error_msg = e.to_string();
                         println!("  [ERROR] {}: {}", action.src.file_name().unwrap_or_default().to_string_lossy(), e);
-                        // Mark as error with error details
+
+                        // Record error immediately after failed operation
+                        journal.record(
+                            "error",
+                            &action.hash,
+                            &action.src.to_string_lossy(),
+                            &dst.to_string_lossy(),
+                            &error_msg,
+                        )?;
                         report.actions[idx].status = "error".to_string();
                         report.actions[idx].note = format!("rename failed: {}", error_msg);
                     }
@@ -439,7 +464,7 @@ impl RenameOperation {
 
         println!("重命名完成: 成功 {}, 失败 {}", success, failed);
 
-        Ok(())
+        Ok(log_file)
     }
 
     fn print_apply_summary(&self, report: &Report, log_file: &str) -> Result<()> {

@@ -26,10 +26,6 @@ struct Cli {
     #[arg(long)]
     verify: bool,
 
-    /// Update hashfile after renaming
-    #[arg(long)]
-    update_manifest: bool,
-
     /// Include all file types, not just videos
     #[arg(long)]
     all_files: bool,
@@ -63,7 +59,6 @@ fn main() -> Result<()> {
                 path,
                 cli.hashfile,
                 cli.verify,
-                cli.update_manifest,
                 !cli.apply, // dry_run is true when apply is false
                 cli.all_files,
             )?;
