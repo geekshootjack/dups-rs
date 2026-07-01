@@ -24,17 +24,15 @@ impl HashFile {
         {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if pattern.ends_with(".xxh3") && name.ends_with(".xxh3") {
-                    // Skip already-renamed copies
-                    if !name.contains("_renamed") {
-                        found.push(path.to_path_buf());
-                    }
-                } else if pattern.ends_with(".xxh") && name.ends_with(".xxh")
-                    && !name.ends_with(".xxh3")
-                {
-                    if !name.contains("_renamed") {
-                        found.push(path.to_path_buf());
-                    }
+                if name.contains("_renamed") {
+                    continue;
+                }
+
+                let is_matching = (pattern.ends_with(".xxh3") && name.ends_with(".xxh3"))
+                    || (pattern.ends_with(".xxh") && name.ends_with(".xxh") && !name.ends_with(".xxh3"));
+
+                if is_matching {
+                    found.push(path.to_path_buf());
                 }
             }
         }
