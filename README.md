@@ -1,4 +1,4 @@
-# dups — Collision-proof media filenames via xxHash3
+# dups
 
 Append xxHash3-64 checksums to media filenames so that two files can never collide by name. Same name implies same content by construction.
 
