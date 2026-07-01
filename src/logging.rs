@@ -93,14 +93,14 @@ pub fn undo(log_path: &Path) -> Result<()> {
         }
 
         // Format: timestamp, status, hash, old_path, new_path, note
-        let status = record.get(1).unwrap_or(&"");
+        let status = record.get(1).unwrap_or("");
         // Only undo files that were actually renamed (status == "renamed")
         if status != "renamed" {
             continue;
         }
 
-        let old = record.get(3).unwrap_or(&"").to_string();
-        let new = record.get(4).unwrap_or(&"").to_string();
+        let old = record.get(3).unwrap_or("").to_string();
+        let new = record.get(4).unwrap_or("").to_string();
 
         if !old.is_empty() && !new.is_empty() && !seen_set.contains(&(old.clone(), new.clone()))
         {

@@ -271,7 +271,7 @@ impl RenameOperation {
 
             proposed
                 .entry(target.to_string_lossy().to_lowercase())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(action);
         }
 
@@ -363,12 +363,9 @@ impl RenameOperation {
         for orphan in &report.orphans {
             writeln!(
                 file,
-                "{},{},{},{},{}",
+                "{},orphan,,{},no hash in any manifest",
                 now,
-                "orphan",
-                "",
-                escape_csv_value(&orphan.to_string_lossy()),
-                "no hash in any manifest"
+                escape_csv_value(&orphan.to_string_lossy())
             )?;
         }
 
@@ -376,11 +373,8 @@ impl RenameOperation {
         for warning in &report.warnings {
             writeln!(
                 file,
-                "{},{},{},{},{}",
+                "{},warning,,,{}",
                 now,
-                "warning",
-                "",
-                "",
                 escape_csv_value(warning)
             )?;
         }
