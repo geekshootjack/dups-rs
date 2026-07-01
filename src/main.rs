@@ -8,7 +8,7 @@ mod logging;
 mod rename;
 
 #[derive(Parser)]
-#[command(name = "dups")]
+#[command(name = "dups", version)]
 #[command(about = "Rename files with xxHash3 suffix for deduplication", long_about = None)]
 struct Cli {
     /// Input directory path
