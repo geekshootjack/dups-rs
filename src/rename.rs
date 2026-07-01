@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_VIDEO_EXTS: &[&str] = &[
+pub const DEFAULT_VIDEO_EXTS: &[&str] = &[
     ".mp4", ".mov", ".mxf", ".avi", ".mts", ".m2ts", ".m2t", ".ts", ".mkv", ".m4v",
     ".mpg", ".mpeg", ".wmv", ".braw", ".r3d", ".ari", ".arx", ".insv", ".lrv", ".3gp",
     ".vob", ".mod", ".tod",
@@ -106,7 +106,7 @@ impl RenameOperation {
             let manifests = HashFile::find_in_dir(&self.path, "*.xxh3")?;
             if manifests.is_empty() {
                 println!(
-                    "未找到 .xxh3 文件。要自动生成吗? (暂不实现自动生成)"
+                    "未找到 .xxh3 文件。可运行 dups generate <PATH> 自动生成。"
                 );
                 return Ok(Vec::new());
             }
@@ -484,10 +484,9 @@ impl RenameOperation {
 
         if renamed > 0 {
             println!("\nNext steps:");
-            println!("  1. 检查结果是否满意");
-            println!("  2. 如需撤销所有改名，运行:");
+            println!("  1. 如需撤销所有改名，运行:");
             println!("     dups undo {}", log_file);
-            println!("  3. 详细日志见: {}", log_file);
+            println!("  2. 详细日志见: {}", log_file);
         }
 
         Ok(())
@@ -498,7 +497,7 @@ impl RenameOperation {
     }
 }
 
-fn is_system_file(path: &Path) -> bool {
+pub fn is_system_file(path: &Path) -> bool {
     const SYSTEM_EXTS: &[&str] = &[
         ".exe", ".dll", ".sys", ".driver", ".scr",
         ".bat", ".cmd", ".ps1", ".msi",
@@ -518,7 +517,7 @@ fn is_system_file(path: &Path) -> bool {
     }
 }
 
-fn is_video(path: &Path, exts: &[String]) -> bool {
+pub fn is_video(path: &Path, exts: &[String]) -> bool {
     if let Some(ext) = path.extension() {
         if let Some(ext_str) = ext.to_str() {
             let ext_lower = format!(".{}", ext_str.to_lowercase());
