@@ -1,13 +1,12 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
-use xxhash_rust::xxh3::Xxh3;
 
 use crate::hashfile::{path_key, HashFile};
-use crate::rename::{is_system_file, is_video, DEFAULT_VIDEO_EXTS};
+use crate::rename::{hash_file_chunks, passes_filters};
 
 struct FileEntry {
     path: PathBuf,
@@ -55,29 +54,11 @@ pub fn generate(path: &Path, output: Option<&Path>, all_files: bool) -> Result<(
 
     println!("扫描目录: {}", path.display());
 
-    let video_exts: Vec<String> = DEFAULT_VIDEO_EXTS.iter().map(|s| s.to_string()).collect();
-
     let mut files: Vec<FileEntry> = Vec::new();
     for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
         let p = entry.path();
-        if !p.is_file() {
+        if !passes_filters(p, all_files) {
             continue;
-        }
-        if is_system_file(p) {
-            continue;
-        }
-        if !all_files && !is_video(p, &video_exts) {
-            continue;
-        }
-        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-            if ext.eq_ignore_ascii_case("xxh3") || ext.eq_ignore_ascii_case("xxh") {
-                continue;
-            }
-        }
-        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("dups-") && name.ends_with(".csv") {
-                continue;
-            }
         }
         let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         files.push(FileEntry {
@@ -212,7 +193,7 @@ pub fn generate(path: &Path, output: Option<&Path>, all_files: bool) -> Result<(
 
     println!("\n可直接用此清单执行重命名:");
     println!(
-        "  dups {} --hashfile {}",
+        "  dups rename {} --hashfile {}",
         path.display(),
         output_path.display()
     );
@@ -227,21 +208,15 @@ fn hash_file_with_progress(
     rel_path: &Path,
     progress: &mut Progress,
 ) -> Result<String> {
-    let mut hasher = Xxh3::new();
-    let mut file = std::fs::File::open(path)?;
-    let mut buffer = vec![0u8; 16 * 1024 * 1024]; // 16MB
     let mut file_bytes_read: u64 = 0;
     let mut last_progress = Instant::now();
     let large_file = file_size > 256 * 1024 * 1024;
 
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-        file_bytes_read += n as u64;
-        progress.bytes_done += n as u64;
+    // Reuses the single chunked xxh3 reader (rename::hash_file_chunks); this
+    // closure only adds the multi-file progress-bar rendering on top of it.
+    hash_file_chunks(path, |n| {
+        file_bytes_read += n;
+        progress.bytes_done += n;
 
         if large_file && last_progress.elapsed().as_millis() >= 500 {
             last_progress = Instant::now();
@@ -271,9 +246,7 @@ fn hash_file_with_progress(
             );
             std::io::stdout().flush().ok();
         }
-    }
-
-    Ok(format!("{:016X}", hasher.digest()))
+    })
 }
 
 fn write_hashfile(output: &Path, base: &Path, entries: &[(PathBuf, String)]) -> Result<()> {
@@ -294,7 +267,7 @@ fn write_hashfile(output: &Path, base: &Path, entries: &[(PathBuf, String)]) -> 
     Ok(())
 }
 
-fn format_size(bytes: u64) -> String {
+pub fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;

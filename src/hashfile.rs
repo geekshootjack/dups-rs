@@ -9,6 +9,10 @@ pub struct HashEntry {
     pub hash: String,
     pub abs_path: PathBuf,
     pub manifest_path: PathBuf,
+    /// True when the hash was computed on the fly (e.g. by `rename --only-dupes`
+    /// for a file not covered by any manifest) rather than read from a manifest.
+    /// Freshly-computed hashes are trusted as-is and must not be re-verified.
+    pub computed: bool,
 }
 
 /// Case-insensitive path key on case-insensitive filesystems (Windows, macOS),
@@ -19,6 +23,21 @@ pub fn path_key(p: &Path) -> String {
         s.to_lowercase()
     } else {
         s.to_string()
+    }
+}
+
+/// Case-insensitive filename key (ignores directory) on case-insensitive
+/// filesystems (Windows, macOS), case-sensitive elsewhere (Linux). Used to
+/// group files that share a filename regardless of which directory they live in.
+pub fn name_key(p: &Path) -> String {
+    let s = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        s.to_lowercase()
+    } else {
+        s
     }
 }
 
@@ -98,6 +117,7 @@ impl HashFile {
                 hash,
                 abs_path,
                 manifest_path: manifest_path.to_path_buf(),
+                computed: false,
             });
         }
 
