@@ -2,10 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-mod generate;
-mod hashfile;
-mod logging;
-mod rename;
+use dups::{generate, logging, rename};
 
 #[derive(Parser)]
 #[command(name = "dups", version)]

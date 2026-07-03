@@ -6,7 +6,7 @@ use std::time::Instant;
 use walkdir::WalkDir;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::hashfile::HashFile;
+use crate::hashfile::{path_key, HashFile};
 use crate::rename::{is_system_file, is_video, DEFAULT_VIDEO_EXTS};
 
 struct FileEntry {
@@ -106,15 +106,14 @@ pub fn generate(path: &Path, output: Option<&Path>, all_files: bool) -> Result<(
     let existing_manifests = HashFile::find_in_dir(path, "*.xxh3")?;
     if !existing_manifests.is_empty() {
         let existing_entries = HashFile::load_all(&existing_manifests)?;
-        let existing_paths: HashSet<String> = existing_entries
-            .iter()
-            .map(|e| e.abs_path.to_string_lossy().to_lowercase())
-            .collect();
+        let existing_paths: HashSet<String> =
+            existing_entries.iter().map(|e| path_key(&e.abs_path)).collect();
 
         let mut covered = 0usize;
         let mut orphans = 0usize;
         for file in &files {
-            if existing_paths.contains(&file.path.to_string_lossy().to_lowercase()) {
+            let abs = std::path::absolute(&file.path).unwrap_or_else(|_| file.path.clone());
+            if existing_paths.contains(&path_key(&abs)) {
                 covered += 1;
             } else {
                 orphans += 1;

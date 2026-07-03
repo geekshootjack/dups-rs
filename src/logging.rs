@@ -62,10 +62,12 @@ pub fn record(
     }
 }
 
-fn escape_csv(s: &str) -> String {
+/// Shared CSV field escaper. Quotes when the value contains a comma, quote,
+/// or a CR/LF (a bare `\r` also breaks CSV rows, so it must trigger quoting).
+pub fn escape_csv(s: &str) -> String {
     if s.is_empty() {
         String::new()
-    } else if s.contains(',') || s.contains('"') || s.contains('\n') {
+    } else if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_string()
@@ -83,8 +85,16 @@ pub fn undo(log_path: &Path) -> Result<()> {
     let file = std::fs::File::open(log_path)?;
     let mut reader = csv::Reader::from_reader(file);
 
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut seen_set: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // We revert two kinds of rows:
+    //   1. status == "renamed": a rename that completed and was journaled.
+    //   2. status == "pending" with no terminal ("renamed"/"error") row for the
+    //      same (old,new) pair: a crash may have occurred after the rename but
+    //      before the terminal record was written. We rely on the per-pair disk
+    //      checks below to decide whether the rename actually happened.
+    let mut renamed_pairs: Vec<(String, String)> = Vec::new();
+    let mut pending_pairs: Vec<(String, String)> = Vec::new();
+    let mut terminal: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
 
     for record in reader.records() {
         let record = record?;
@@ -94,18 +104,44 @@ pub fn undo(log_path: &Path) -> Result<()> {
 
         // Format: timestamp, status, hash, old_path, new_path, note
         let status = record.get(1).unwrap_or("");
-        // Only undo files that were actually renamed (status == "renamed")
-        if status != "renamed" {
+        let old = record.get(3).unwrap_or("").to_string();
+        let new = record.get(4).unwrap_or("").to_string();
+        if old.is_empty() || new.is_empty() {
             continue;
         }
 
-        let old = record.get(3).unwrap_or("").to_string();
-        let new = record.get(4).unwrap_or("").to_string();
+        match status {
+            "renamed" => {
+                terminal.insert((old.clone(), new.clone()));
+                renamed_pairs.push((old, new));
+            }
+            "error" => {
+                // A terminal row: the rename failed, so there is nothing to
+                // revert, and it should suppress any earlier pending row.
+                terminal.insert((old, new));
+            }
+            "pending" => {
+                pending_pairs.push((old, new));
+            }
+            _ => {}
+        }
+    }
 
-        if !old.is_empty() && !new.is_empty() && !seen_set.contains(&(old.clone(), new.clone()))
-        {
-            pairs.push((old.clone(), new.clone()));
-            seen_set.insert((old, new));
+    // Build the ordered, de-duplicated revert list: all renamed pairs first,
+    // then pending pairs that have no terminal row (disk-state-aware recovery).
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut seen_set: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for (old, new) in renamed_pairs {
+        if seen_set.insert((old.clone(), new.clone())) {
+            pairs.push((old, new));
+        }
+    }
+    for (old, new) in pending_pairs {
+        if terminal.contains(&(old.clone(), new.clone())) {
+            continue;
+        }
+        if seen_set.insert((old.clone(), new.clone())) {
+            pairs.push((old, new));
         }
     }
 

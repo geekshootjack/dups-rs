@@ -1,8 +1,9 @@
-use crate::hashfile::{HashEntry, HashFile};
-use crate::logging::Journal;
+use crate::hashfile::{path_key, HashEntry, HashFile};
+use crate::logging::{escape_csv, Journal};
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 pub const DEFAULT_VIDEO_EXTS: &[&str] = &[
     ".mp4", ".mov", ".mxf", ".avi", ".mts", ".m2ts", ".m2t", ".ts", ".mkv", ".m4v",
@@ -70,11 +71,11 @@ impl RenameOperation {
         self.print_report(&report)?;
 
         if self.dry_run {
-            // Write dry-run report
+            // Write dry-run report into the target directory (not the CWD).
             let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            let log_file = format!("dups-dryrun-{}.csv", now);
-            self.write_csv_log(&report, &log_file)?;
-            println!("\n日志已写出: {}", log_file);
+            let log_path = self.path.join(format!("dups-dryrun-{}.csv", now));
+            self.write_csv_log(&report, &log_path)?;
+            println!("\n日志已写出: {}", log_path.display());
 
             println!("\n*** 预演模式 (DRY-RUN) *** 未改动任何文件。");
             let to_rename = report
@@ -114,7 +115,7 @@ impl RenameOperation {
         }
     }
 
-    fn build_plan(&self, entries: &[HashEntry]) -> Result<Report> {
+    pub fn build_plan(&self, entries: &[HashEntry]) -> Result<Report> {
         let mut report = Report {
             actions: Vec::new(),
             orphans: Vec::new(),
@@ -122,12 +123,18 @@ impl RenameOperation {
         };
 
         let mut seen_src: HashMap<String, HashEntry> = HashMap::new();
+        let mut conflicting: HashSet<String> = HashSet::new();
         let video_exts = self.get_video_exts();
         let sep = "_";
 
-        // De-duplicate entries
+        // De-duplicate entries. A path listed with two *different* hashes is a
+        // conflict: it must be excluded from renaming entirely (a single
+        // "conflict" action, and removed from seen_src so it is never renamed).
         for entry in entries {
-            let key = entry.abs_path.to_string_lossy().to_lowercase();
+            let key = path_key(&entry.abs_path);
+            if conflicting.contains(&key) {
+                continue;
+            }
             if let Some(prev) = seen_src.get(&key) {
                 if prev.hash != entry.hash {
                     let warning = format!(
@@ -151,13 +158,20 @@ impl RenameOperation {
                             prev.hash, entry.hash
                         ),
                     });
+
+                    // Exclude the path from renaming: drop the first entry and
+                    // remember the conflict so any further entries are ignored.
+                    seen_src.remove(&key);
+                    conflicting.insert(key);
                 }
+                // else: identical duplicate, ignore.
             } else {
                 seen_src.insert(key, entry.clone());
             }
         }
 
-        let mut proposed: HashMap<String, Vec<Action>> = HashMap::new();
+        // Map target-path key -> indices into report.actions for collision detection.
+        let mut proposed: HashMap<String, Vec<usize>> = HashMap::new();
 
         for entry in seen_src.values() {
             let src = &entry.abs_path;
@@ -189,11 +203,12 @@ impl RenameOperation {
             // Compute target name
             let target = target_for(src, &entry.hash, sep);
 
-            // Idempotency: already suffixed
-            if src.file_name() == target.file_name() {
+            // Idempotency: the file stem already ends with `_{hash}` (case-insensitive),
+            // so it has already been suffixed. Renaming again would produce `_HASH_HASH`.
+            if already_suffixed(src, &entry.hash) {
                 report.actions.push(Action {
                     src: src.clone(),
-                    dst: Some(target),
+                    dst: Some(src.clone()),
                     hash: entry.hash.clone(),
                     status: "done".to_string(),
                     note: "already suffixed".to_string(),
@@ -267,23 +282,57 @@ impl RenameOperation {
                 note: String::new(),
             };
 
-            report.actions.push(action.clone());
-
-            proposed
-                .entry(target.to_string_lossy().to_lowercase())
-                .or_default()
-                .push(action);
+            let target_key = path_key(&target);
+            report.actions.push(action);
+            let idx = report.actions.len() - 1;
+            proposed.entry(target_key).or_default().push(idx);
         }
 
-        // Check for collisions
-        for acts in proposed.values_mut() {
-            if acts.len() > 1 {
-                let count = acts.len();
-                for a in acts.iter_mut() {
-                    a.status = "conflict".to_string();
-                    a.note = format!("{} different files would collide on target name", count);
+        // Check for collisions: mutate the real actions (report.actions), not clones.
+        for idxs in proposed.values() {
+            if idxs.len() > 1 {
+                let count = idxs.len();
+                for &idx in idxs {
+                    report.actions[idx].status = "conflict".to_string();
+                    report.actions[idx].note =
+                        format!("{} different files would collide on target name", count);
                 }
             }
+        }
+
+        // Populate orphans: files in the target directory that pass the same
+        // filters but are not covered by any manifest entry (not a source, not a
+        // planned/done target). Reporting only; never renamed.
+        let mut covered: HashSet<String> = HashSet::new();
+        for action in &report.actions {
+            covered.insert(path_key(&action.src));
+            if let Some(dst) = &action.dst {
+                covered.insert(path_key(dst));
+            }
+        }
+        for entry in WalkDir::new(&self.path).into_iter().filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if !p.is_file() || is_system_file(p) {
+                continue;
+            }
+            if !self.all_files && !is_video(p, &video_exts) {
+                continue;
+            }
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if ext.eq_ignore_ascii_case("xxh3") || ext.eq_ignore_ascii_case("xxh") {
+                    continue;
+                }
+            }
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("dups-") && name.ends_with(".csv") {
+                    continue;
+                }
+            }
+            let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+            if covered.contains(&path_key(&abs)) {
+                continue;
+            }
+            report.orphans.push(abs);
         }
 
         Ok(report)
@@ -328,11 +377,11 @@ impl RenameOperation {
         Ok(())
     }
 
-    fn write_csv_log(&self, report: &Report, filename: &str) -> Result<()> {
+    fn write_csv_log(&self, report: &Report, path: &Path) -> Result<()> {
         use std::fs::File;
         use std::io::Write;
 
-        let mut file = File::create(filename)?;
+        let mut file = File::create(path)?;
 
         // Write UTF-8 BOM for Windows compatibility
         file.write_all(&[0xEF, 0xBB, 0xBF])?;
@@ -353,19 +402,19 @@ impl RenameOperation {
                 now,
                 action.status,
                 action.hash,
-                escape_csv_value(&old_path),
-                escape_csv_value(&new_path),
-                escape_csv_value(&action.note)
+                escape_csv(&old_path),
+                escape_csv(&new_path),
+                escape_csv(&action.note)
             )?;
         }
 
-        // Write orphans
+        // Write orphans (schema: timestamp,status,hash,old_path,new_path,note)
         for orphan in &report.orphans {
             writeln!(
                 file,
-                "{},orphan,,{},no hash in any manifest",
+                "{},orphan,,{},,no hash in any manifest",
                 now,
-                escape_csv_value(&orphan.to_string_lossy())
+                escape_csv(&orphan.to_string_lossy())
             )?;
         }
 
@@ -373,9 +422,9 @@ impl RenameOperation {
         for warning in &report.warnings {
             writeln!(
                 file,
-                "{},warning,,,{}",
+                "{},warning,,,,{}",
                 now,
-                escape_csv_value(warning)
+                escape_csv(warning)
             )?;
         }
 
@@ -391,74 +440,103 @@ impl RenameOperation {
             .map(|(i, _)| i)
             .collect();
 
+        let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        // Write the applied log into the target directory (not the CWD).
+        let log_path = self.path.join(format!("dups-applied-{}.csv", now));
+        let log_display = log_path.to_string_lossy().to_string();
+
         if to_rename_indices.is_empty() {
             println!("没有需要改名的文件。");
-            let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
-            let log_file = format!("dups-applied-{}.csv", now);
-            Journal::new(std::path::Path::new(&log_file))?;
-            return Ok(log_file);
+            Journal::new(&log_path)?;
+            return Ok(log_display);
         }
 
         println!("开始执行 {} 个重命名...", to_rename_indices.len());
 
-        let now = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let log_file = format!("dups-applied-{}.csv", now);
-        let mut journal = Journal::new(std::path::Path::new(&log_file))?;
+        let mut journal = Journal::new(&log_path)?;
 
         let mut success = 0;
         let mut failed = 0;
 
         for idx in to_rename_indices {
-            let action = &report.actions[idx];
-            if let Some(dst) = &action.dst {
-                // Write-ahead logging: record intention BEFORE executing
-                journal.record(
-                    "pending",
-                    &action.hash,
-                    &action.src.to_string_lossy(),
-                    &dst.to_string_lossy(),
-                    "about to rename",
-                )?;
+            let (src, dst, hash) = {
+                let a = &report.actions[idx];
+                match &a.dst {
+                    Some(dst) => (a.src.clone(), dst.clone(), a.hash.clone()),
+                    None => continue,
+                }
+            };
+            let src_name = src.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-                // Now execute the rename
-                match std::fs::rename(&action.src, dst) {
-                    Ok(_) => {
-                        success += 1;
-                        println!("  [OK] {}", action.src.file_name().unwrap_or_default().to_string_lossy());
+            // Re-check disk state immediately before renaming: the plan->apply
+            // gap can be large (especially with --verify), and std::fs::rename
+            // silently overwrites an existing destination on Windows and Linux.
+            if !src.exists() {
+                failed += 1;
+                let msg = "source no longer exists at apply time";
+                println!("  [ERROR] {}: {}", src_name, msg);
+                journal.record("error", &hash, &src.to_string_lossy(), &dst.to_string_lossy(), msg)?;
+                report.actions[idx].status = "error".to_string();
+                report.actions[idx].note = msg.to_string();
+                continue;
+            }
+            if dst.exists() {
+                failed += 1;
+                let msg = "target now exists on disk (would overwrite); skipped";
+                println!("  [ERROR] {}: {}", src_name, msg);
+                journal.record("conflict", &hash, &src.to_string_lossy(), &dst.to_string_lossy(), msg)?;
+                report.actions[idx].status = "conflict".to_string();
+                report.actions[idx].note = msg.to_string();
+                continue;
+            }
 
-                        // Record success immediately after operation
-                        journal.record(
-                            "renamed",
-                            &action.hash,
-                            &action.src.to_string_lossy(),
-                            &dst.to_string_lossy(),
-                            "",
-                        )?;
-                        report.actions[idx].status = "renamed".to_string();
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        let error_msg = e.to_string();
-                        println!("  [ERROR] {}: {}", action.src.file_name().unwrap_or_default().to_string_lossy(), e);
+            // Write-ahead logging: record intention BEFORE executing
+            journal.record(
+                "pending",
+                &hash,
+                &src.to_string_lossy(),
+                &dst.to_string_lossy(),
+                "about to rename",
+            )?;
 
-                        // Record error immediately after failed operation
-                        journal.record(
-                            "error",
-                            &action.hash,
-                            &action.src.to_string_lossy(),
-                            &dst.to_string_lossy(),
-                            &error_msg,
-                        )?;
-                        report.actions[idx].status = "error".to_string();
-                        report.actions[idx].note = format!("rename failed: {}", error_msg);
-                    }
+            // Now execute the rename
+            match std::fs::rename(&src, &dst) {
+                Ok(_) => {
+                    success += 1;
+                    println!("  [OK] {}", src_name);
+
+                    // Record success immediately after operation
+                    journal.record(
+                        "renamed",
+                        &hash,
+                        &src.to_string_lossy(),
+                        &dst.to_string_lossy(),
+                        "",
+                    )?;
+                    report.actions[idx].status = "renamed".to_string();
+                }
+                Err(e) => {
+                    failed += 1;
+                    let error_msg = e.to_string();
+                    println!("  [ERROR] {}: {}", src_name, e);
+
+                    // Record error immediately after failed operation
+                    journal.record(
+                        "error",
+                        &hash,
+                        &src.to_string_lossy(),
+                        &dst.to_string_lossy(),
+                        &error_msg,
+                    )?;
+                    report.actions[idx].status = "error".to_string();
+                    report.actions[idx].note = format!("rename failed: {}", error_msg);
                 }
             }
         }
 
         println!("重命名完成: 成功 {}, 失败 {}", success, failed);
 
-        Ok(log_file)
+        Ok(log_display)
     }
 
     fn print_apply_summary(&self, report: &Report, log_file: &str) -> Result<()> {
@@ -543,22 +621,29 @@ fn target_for(src: &Path, hash: &str, sep: &str) -> PathBuf {
     }
 }
 
-fn escape_csv_value(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
+/// True when the file stem already ends with `_{hash}` (case-insensitive 16-hex
+/// compare), i.e. the file has already been suffixed. Prevents `_HASH_HASH`.
+pub fn already_suffixed(src: &Path, hash: &str) -> bool {
+    if let Some(stem) = src.file_stem().and_then(|s| s.to_str()) {
+        let suffix = format!("_{}", hash);
+        let stem_bytes = stem.as_bytes();
+        if stem_bytes.len() >= suffix.len() {
+            let tail = &stem_bytes[stem_bytes.len() - suffix.len()..];
+            return tail.eq_ignore_ascii_case(suffix.as_bytes());
+        }
     }
+    false
 }
 
-fn verify_hash(path: &Path, expected: &str) -> Result<()> {
+/// Compute the xxHash3-64 of a file as a zero-padded 16-char uppercase hex string.
+pub fn hash_file(path: &Path) -> Result<String> {
+    use std::io::Read;
     use xxhash_rust::xxh3::Xxh3;
 
     let mut hasher = Xxh3::new();
     let mut file = std::fs::File::open(path)?;
     let mut buffer = vec![0u8; 16 * 1024 * 1024]; // 16MB chunks
 
-    use std::io::Read;
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
@@ -567,7 +652,13 @@ fn verify_hash(path: &Path, expected: &str) -> Result<()> {
         hasher.update(&buffer[..n]);
     }
 
-    let got = format!("{:X}", hasher.digest());
+    // Zero-pad to 16 hex digits: {:X} drops leading zeros, causing ~1/16 of
+    // files to appear to mismatch. generate.rs uses {:016X} for the same reason.
+    Ok(format!("{:016X}", hasher.digest()))
+}
+
+pub fn verify_hash(path: &Path, expected: &str) -> Result<()> {
+    let got = hash_file(path)?;
     if got == expected.to_uppercase() {
         Ok(())
     } else {

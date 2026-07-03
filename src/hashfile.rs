@@ -11,6 +11,17 @@ pub struct HashEntry {
     pub manifest_path: PathBuf,
 }
 
+/// Case-insensitive path key on case-insensitive filesystems (Windows, macOS),
+/// case-sensitive elsewhere (Linux). Used for de-duplication and collision keys.
+pub fn path_key(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if cfg!(windows) || cfg!(target_os = "macos") {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
 pub struct HashFile;
 
 impl HashFile {
@@ -45,7 +56,10 @@ impl HashFile {
     /// Format: HASH MARKER RELPATH
     /// Example: DA8E2D45A806549D *【素材】\20251215\侧机位m3\20251215-3.MP4
     pub fn parse(manifest_path: &Path) -> Result<Vec<HashEntry>> {
-        let content = std::fs::read_to_string(manifest_path)?;
+        let raw = std::fs::read_to_string(manifest_path)?;
+        // Strip a leading UTF-8 BOM (TeraCopy and other Windows tools emit one);
+        // otherwise the first entry silently fails to parse.
+        let content = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
         let base = manifest_path.parent().ok_or_else(|| anyhow!("No parent dir"))?;
         let mut entries = Vec::new();
 
@@ -69,12 +83,16 @@ impl HashFile {
             let rel_path_str = &caps[3];
 
             // Convert Windows paths to current OS
-            let abs_path = if cfg!(windows) {
+            let joined = if cfg!(windows) {
                 base.join(rel_path_str)
             } else {
                 let normalized = rel_path_str.replace('\\', "/");
                 base.join(normalized)
             };
+            // Absolutize so journals/CSV logs record absolute paths; undo then
+            // operates on absolute paths regardless of the current directory.
+            // std::path::absolute is purely lexical (no FS access, no `\\?\` prefix).
+            let abs_path = std::path::absolute(&joined).unwrap_or(joined);
 
             entries.push(HashEntry {
                 hash,
@@ -94,19 +112,21 @@ impl HashFile {
         for manifest in manifests {
             let entries = Self::parse(manifest)?;
             for entry in entries {
-                let key = entry.abs_path.to_string_lossy().to_lowercase();
-                if let Some(prev) = seen.get(&key) {
-                    if prev.hash != entry.hash {
-                        eprintln!(
-                            "Warning: {} listed with two different hashes: {} vs {}",
-                            entry.abs_path.display(),
-                            prev.hash,
-                            entry.hash
-                        );
+                let key = path_key(&entry.abs_path);
+                match seen.get(&key) {
+                    Some(prev) if prev.hash == entry.hash => {
+                        // Identical duplicate across manifests: drop it.
                     }
-                } else {
-                    all_entries.push(entry.clone());
-                    seen.insert(key, entry);
+                    Some(_) => {
+                        // Conflicting hashes for the same path: keep this entry too
+                        // (don't silently keep only the first) so that the caller
+                        // (build_plan) can detect the conflict and refuse the rename.
+                        all_entries.push(entry);
+                    }
+                    None => {
+                        all_entries.push(entry.clone());
+                        seen.insert(key, entry);
+                    }
                 }
             }
         }
