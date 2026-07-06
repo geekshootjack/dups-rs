@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            target: x86_64-pc-windows-gnu
+            target: x86_64-pc-windows-msvc
             binary: dups.exe
 
           - os: macos-latest
