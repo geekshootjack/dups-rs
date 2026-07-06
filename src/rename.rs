@@ -33,6 +33,7 @@ pub struct RenameOperation {
     verify: bool,
     dry_run: bool,
     all_files: bool,
+    only_dupes: bool,
 }
 
 impl RenameOperation {
@@ -42,6 +43,7 @@ impl RenameOperation {
         verify: bool,
         dry_run: bool,
         all_files: bool,
+        only_dupes: bool,
     ) -> Result<Self> {
         if !path.exists() || !path.is_dir() {
             return Err(anyhow!("Path does not exist or is not a directory: {}", path.display()));
@@ -53,14 +55,25 @@ impl RenameOperation {
             verify,
             dry_run,
             all_files,
+            only_dupes,
         })
     }
 
     pub fn execute(&self) -> Result<()> {
-        // Find or load hashfile
-        let entries = self.load_entries()?;
+        // Find or load hashfile entries: the full manifest set normally, or (with
+        // --only-dupes) only the entries needed for duplicate-name group members,
+        // computing hashes on the fly for anything not covered by a manifest.
+        let entries = if self.only_dupes {
+            self.load_only_dupes_entries()?
+        } else {
+            self.load_entries()?
+        };
         if entries.is_empty() {
-            println!("没有找到任何哈希条目");
+            if self.only_dupes {
+                println!("未发现重名文件, 无需改名。");
+            } else {
+                println!("没有找到任何哈希条目");
+            }
             return Ok(());
         }
 
@@ -97,6 +110,13 @@ impl RenameOperation {
     }
 
     fn load_entries(&self) -> Result<Vec<HashEntry>> {
+        self.load_manifest_entries(false)
+    }
+
+    /// Load manifest entries (explicit --hashfile, or discovered *.xxh3 files).
+    /// When `quiet` is set, a missing/empty manifest set is not an error and
+    /// prints nothing (used by --only-dupes, where hashes can be computed).
+    fn load_manifest_entries(&self, quiet: bool) -> Result<Vec<HashEntry>> {
         if let Some(manifest_path) = &self.hashfile {
             if !manifest_path.exists() {
                 return Err(anyhow!("Hashfile not found: {}", manifest_path.display()));
@@ -106,13 +126,68 @@ impl RenameOperation {
             // Find .xxh3 files in the directory
             let manifests = HashFile::find_in_dir(&self.path, "*.xxh3")?;
             if manifests.is_empty() {
-                println!(
-                    "未找到 .xxh3 文件。可运行 dups generate <PATH> 自动生成。"
-                );
+                if !quiet {
+                    println!(
+                        "未找到 .xxh3 文件。可运行 dups generate <PATH> 自动生成。"
+                    );
+                }
                 return Ok(Vec::new());
             }
             HashFile::load_all(&manifests)
         }
+    }
+
+    /// Build the entry set for `--only-dupes`: only duplicate-filename group
+    /// members, sourced from any available manifest where possible, with hashes
+    /// computed on the fly for members no manifest covers. Exposed (not just
+    /// used internally by `execute`) so callers/tests can inspect the plan
+    /// without going through the full dry-run/apply/logging flow.
+    pub fn load_only_dupes_entries(&self) -> Result<Vec<HashEntry>> {
+        let (_total, groups) = crate::check::scan_duplicate_groups(&self.path, self.all_files)?;
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let manifest_entries = self.load_manifest_entries(true)?;
+        let mut by_path: HashMap<String, Vec<HashEntry>> = HashMap::new();
+        for e in manifest_entries {
+            by_path.entry(path_key(&e.abs_path)).or_default().push(e);
+        }
+
+        let mut result = Vec::new();
+        for group in &groups {
+            // Benign groups (shared filename already carries the same hash
+            // suffix) are true copies by this tool's invariant: nothing to
+            // rename, so skip them entirely — most importantly, do NOT re-hash
+            // potentially huge files just to conclude "done" on every re-run.
+            if group.benign {
+                continue;
+            }
+            for member in &group.members {
+                let key = path_key(member);
+                if let Some(hits) = by_path.get(&key) {
+                    result.extend(hits.iter().cloned());
+                    continue;
+                }
+
+                let size = std::fs::metadata(member).map(|m| m.len()).unwrap_or(0);
+                let rel = member.strip_prefix(&self.path).unwrap_or(member);
+                println!(
+                    "计算哈希: {} ({})",
+                    rel.display(),
+                    crate::generate::format_size(size)
+                );
+                let hash = hash_file_chunks(member, |_| {})?;
+                result.push(HashEntry {
+                    hash,
+                    abs_path: member.clone(),
+                    manifest_path: PathBuf::from("<computed>"),
+                    computed: true,
+                });
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn build_plan(&self, entries: &[HashEntry]) -> Result<Report> {
@@ -124,7 +199,6 @@ impl RenameOperation {
 
         let mut seen_src: HashMap<String, HashEntry> = HashMap::new();
         let mut conflicting: HashSet<String> = HashSet::new();
-        let video_exts = self.get_video_exts();
         let sep = "_";
 
         // De-duplicate entries. A path listed with two *different* hashes is a
@@ -189,7 +263,7 @@ impl RenameOperation {
             }
 
             // Check if it's a video (unless --all-files is set)
-            if !self.all_files && !is_video(src, &video_exts) {
+            if !self.all_files && !is_video(src, DEFAULT_VIDEO_EXTS) {
                 report.actions.push(Action {
                     src: src.clone(),
                     dst: None,
@@ -254,8 +328,11 @@ impl RenameOperation {
                 continue;
             }
 
-            // Verify hash if requested
-            if self.verify {
+            // Verify hash if requested. Freshly-computed hashes (--only-dupes,
+            // no manifest coverage) were just read from disk; re-reading a huge
+            // file a second time to "verify" the hash we just computed from it
+            // is pointless, so those entries skip verification.
+            if self.verify && !entry.computed {
                 match verify_hash(src, &entry.hash) {
                     Ok(_) => {
                         // Hash is correct, proceed
@@ -302,37 +379,28 @@ impl RenameOperation {
 
         // Populate orphans: files in the target directory that pass the same
         // filters but are not covered by any manifest entry (not a source, not a
-        // planned/done target). Reporting only; never renamed.
-        let mut covered: HashSet<String> = HashSet::new();
-        for action in &report.actions {
-            covered.insert(path_key(&action.src));
-            if let Some(dst) = &action.dst {
-                covered.insert(path_key(dst));
-            }
-        }
-        for entry in WalkDir::new(&self.path).into_iter().filter_map(|e| e.ok()) {
-            let p = entry.path();
-            if !p.is_file() || is_system_file(p) {
-                continue;
-            }
-            if !self.all_files && !is_video(p, &video_exts) {
-                continue;
-            }
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("xxh3") || ext.eq_ignore_ascii_case("xxh") {
-                    continue;
+        // planned/done target). Reporting only; never renamed. Skipped entirely
+        // for --only-dupes: everything outside the duplicate-name groups would
+        // show up as a false "orphan" there.
+        if !self.only_dupes {
+            let mut covered: HashSet<String> = HashSet::new();
+            for action in &report.actions {
+                covered.insert(path_key(&action.src));
+                if let Some(dst) = &action.dst {
+                    covered.insert(path_key(dst));
                 }
             }
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("dups-") && name.ends_with(".csv") {
+            for entry in WalkDir::new(&self.path).into_iter().filter_map(|e| e.ok()) {
+                let p = entry.path();
+                if !passes_filters(p, self.all_files) {
                     continue;
                 }
+                let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+                if covered.contains(&path_key(&abs)) {
+                    continue;
+                }
+                report.orphans.push(abs);
             }
-            let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-            if covered.contains(&path_key(&abs)) {
-                continue;
-            }
-            report.orphans.push(abs);
         }
 
         Ok(report)
@@ -570,9 +638,6 @@ impl RenameOperation {
         Ok(())
     }
 
-    fn get_video_exts(&self) -> Vec<String> {
-        DEFAULT_VIDEO_EXTS.iter().map(|s| s.to_string()).collect()
-    }
 }
 
 pub fn is_system_file(path: &Path) -> bool {
@@ -595,17 +660,44 @@ pub fn is_system_file(path: &Path) -> bool {
     }
 }
 
-pub fn is_video(path: &Path, exts: &[String]) -> bool {
+pub fn is_video(path: &Path, exts: &[&str]) -> bool {
     if let Some(ext) = path.extension() {
         if let Some(ext_str) = ext.to_str() {
             let ext_lower = format!(".{}", ext_str.to_lowercase());
-            exts.iter().any(|e| e == &ext_lower)
+            exts.iter().any(|e| *e == ext_lower)
         } else {
             false
         }
     } else {
         false
     }
+}
+
+/// Shared file predicate used by `check`, `generate`, and the orphan scan in
+/// `rename`: skip non-files, system files, non-video files (unless
+/// `all_files`), hashfiles, and dups-generated CSV logs. Behavior must stay
+/// identical across all three call sites.
+pub fn passes_filters(path: &Path, all_files: bool) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if is_system_file(path) {
+        return false;
+    }
+    if !all_files && !is_video(path, DEFAULT_VIDEO_EXTS) {
+        return false;
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        if ext.eq_ignore_ascii_case("xxh3") || ext.eq_ignore_ascii_case("xxh") {
+            return false;
+        }
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.starts_with("dups-") && name.ends_with(".csv") {
+            return false;
+        }
+    }
+    true
 }
 
 fn target_for(src: &Path, hash: &str, sep: &str) -> PathBuf {
@@ -635,8 +727,30 @@ pub fn already_suffixed(src: &Path, hash: &str) -> bool {
     false
 }
 
-/// Compute the xxHash3-64 of a file as a zero-padded 16-char uppercase hex string.
-pub fn hash_file(path: &Path) -> Result<String> {
+/// True when the file stem ends with `_` followed by exactly 16 hex digits,
+/// i.e. the name already carries *some* hash suffix (the hash itself is not
+/// known a priori — contrast with `already_suffixed`, which checks a specific
+/// hash). Because duplicate-name groups are keyed on the full filename, all
+/// members of a group whose name has a hash suffix share the SAME suffix, and
+/// the name itself proves content identity: such groups are benign true copies.
+/// Kept next to `already_suffixed` so the two suffix definitions stay in sync.
+pub fn has_hash_suffix(src: &Path) -> bool {
+    if let Some(stem) = src.file_stem().and_then(|s| s.to_str()) {
+        let bytes = stem.as_bytes();
+        if bytes.len() >= 17 {
+            let tail = &bytes[bytes.len() - 17..];
+            return tail[0] == b'_' && tail[1..].iter().all(|b| b.is_ascii_hexdigit());
+        }
+    }
+    false
+}
+
+/// Compute the xxHash3-64 of a file as a zero-padded 16-char uppercase hex string,
+/// invoking `on_chunk(bytes_read)` after each chunk is hashed. This is the single
+/// chunked reader shared by the plain `hash_file` below and by callers that want
+/// progress feedback (generate.rs's multi-file progress bar, rename.rs's
+/// --only-dupes on-the-fly hashing) — the hashing/read loop must not be duplicated.
+pub fn hash_file_chunks<F: FnMut(u64)>(path: &Path, mut on_chunk: F) -> Result<String> {
     use std::io::Read;
     use xxhash_rust::xxh3::Xxh3;
 
@@ -650,11 +764,17 @@ pub fn hash_file(path: &Path) -> Result<String> {
             break;
         }
         hasher.update(&buffer[..n]);
+        on_chunk(n as u64);
     }
 
     // Zero-pad to 16 hex digits: {:X} drops leading zeros, causing ~1/16 of
     // files to appear to mismatch. generate.rs uses {:016X} for the same reason.
     Ok(format!("{:016X}", hasher.digest()))
+}
+
+/// Compute the xxHash3-64 of a file as a zero-padded 16-char uppercase hex string.
+pub fn hash_file(path: &Path) -> Result<String> {
+    hash_file_chunks(path, |_| {})
 }
 
 pub fn verify_hash(path: &Path, expected: &str) -> Result<()> {

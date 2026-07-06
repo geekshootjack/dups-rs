@@ -43,27 +43,56 @@ cargo build --release
 
 ## Usage
 
+### Commands
+
+```bash
+dups <PATH>                     # alias for `dups check <PATH>`
+dups check <PATH> [--all-files]
+dups rename <PATH> [--only-dupes] [--apply] [--hashfile <P>] [--verify] [--all-files]
+dups generate <PATH> [-o|--output <P>] [--all-files]
+dups undo <LOG>
+```
+
 ### Basic workflow
 
 ```bash
-# 1. Preview what would be renamed
+# 1. Quick read-only scan for duplicate filenames (no files touched)
 dups /path/to/media
 
-# 2. If it looks good, execute
-dups /path/to/media --apply
+# 2. Preview what would be renamed
+dups rename /path/to/media
 
-# 3. If you need to undo
+# 3. If it looks good, execute
+dups rename /path/to/media --apply
+
+# 4. If you need to undo
 dups undo dups-applied-XXXXXX.csv
+```
+
+### `check` — find duplicate filenames without touching anything
+
+`check` walks a directory read-only and reports filenames that occur more than once (in different subdirectories), together with each file's size, so you can tell at a glance whether they're likely the same content (equal size) or definitely different (different size). It never writes a file and exits non-zero when it finds collisions:
+
+```bash
+dups check /path/to/media
+# or equivalently:
+dups /path/to/media
 ```
 
 ### Options
 
-- `<PATH>` — Directory containing media files and .xxh3 manifest
-- `--apply` — Actually rename files (default is dry-run preview)
-- `--hashfile <PATH>` — Specify manifest path explicitly
-- `--verify` — Verify hashes match before renaming (slow)
-- `--all-files` — Rename all file types, not just videos
-- `--undo <LOG>` — Revert previous rename operation
+- `check <PATH>` — Read-only duplicate-filename scan; exits 1 if any are found, 0 otherwise
+  - `--all-files` — Include all file types, not just videos
+- `rename <PATH>` — Plan/execute renames
+  - `--only-dupes` — Only rename files that are members of a duplicate-filename group (hashes are read from a manifest when available, otherwise computed on the fly)
+  - `--apply` — Actually rename files (default is dry-run preview)
+  - `--hashfile <PATH>` — Specify manifest path explicitly
+  - `--verify` — Verify hashes match before renaming (slow)
+  - `--all-files` — Rename all file types, not just videos
+- `generate <PATH>` — Scan and write a `.xxh3` manifest
+  - `-o, --output <PATH>` — Output manifest path
+  - `--all-files` — Include all file types, not just videos
+- `undo <LOG>` — Revert a previous rename operation
 
 ## How it works
 
@@ -87,6 +116,17 @@ dups undo dups-applied-XXXXXX.csv
 ```
 $ dups /media/videos
 
+检查目录: /media/videos (仅视频文件)
+共扫描 128 个文件。
+
+未发现重名文件。共 128 个文件, 文件名全部唯一。
+```
+
+Planning renames from a manifest:
+
+```
+$ dups rename /media/videos
+
 ======================================================================
 摘要 / Summary
 ----------------------------------------------------------------------
@@ -104,7 +144,7 @@ $ dups /media/videos
 Then with `--apply`:
 
 ```
-$ dups /media/videos --apply
+$ dups rename /media/videos --apply
 
 开始执行 12 个重命名...
   [OK] video1.mp4

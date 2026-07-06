@@ -1,11 +1,13 @@
 //! Integration tests for dups. Uses only std for temp dirs (unique names under
 //! std::env::temp_dir()) so no dev-dependency is required.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dups::check;
 use dups::hashfile::{HashEntry, HashFile};
 use dups::logging::undo;
 use dups::rename::{self, RenameOperation};
@@ -44,6 +46,16 @@ fn entry(hash: &str, path: &Path) -> HashEntry {
         hash: hash.to_string(),
         abs_path: path.to_path_buf(),
         manifest_path: PathBuf::from("dummy.xxh3"),
+        computed: false,
+    }
+}
+
+fn computed_entry(hash: &str, path: &Path) -> HashEntry {
+    HashEntry {
+        hash: hash.to_string(),
+        abs_path: path.to_path_buf(),
+        manifest_path: PathBuf::from("<computed>"),
+        computed: true,
     }
 }
 
@@ -81,7 +93,8 @@ fn double_suffix_idempotency() {
     fs::write(&src, b"hello world").unwrap();
     let hash = rename::hash_file(&src).unwrap();
 
-    let op = RenameOperation::new(dir.path().to_path_buf(), None, false, true, false).unwrap();
+    let op =
+        RenameOperation::new(dir.path().to_path_buf(), None, false, true, false, false).unwrap();
 
     // First plan: a rename is scheduled.
     let report = op.build_plan(&[entry(&hash, &src)]).unwrap();
@@ -120,7 +133,8 @@ fn conflicting_hash_not_renamed() {
     let src = dir.path().join("a.mp4");
     fs::write(&src, b"content").unwrap();
 
-    let op = RenameOperation::new(dir.path().to_path_buf(), None, false, true, false).unwrap();
+    let op =
+        RenameOperation::new(dir.path().to_path_buf(), None, false, true, false, false).unwrap();
     let entries = vec![
         entry("AAAAAAAAAAAAAAAA", &src),
         entry("BBBBBBBBBBBBBBBB", &src),
@@ -254,7 +268,8 @@ fn no_two_renames_share_target() {
     fs::write(&f2, b"2").unwrap();
     fs::write(&f3, b"3").unwrap();
 
-    let op = RenameOperation::new(dir.path().to_path_buf(), None, false, true, false).unwrap();
+    let op =
+        RenameOperation::new(dir.path().to_path_buf(), None, false, true, false, false).unwrap();
     // Include a duplicate entry for f1 to exercise de-duplication too.
     let entries = vec![
         entry("1111111111111111", &f1),
@@ -275,4 +290,345 @@ fn no_two_renames_share_target() {
     targets.dedup();
     assert_eq!(before, targets.len(), "no two renames may share a target");
     assert_eq!(before, 3, "each distinct source should be renamed once");
+}
+
+/// `check` groups files by filename across directories; a same-named pair of a
+/// non-video extension must not be grouped unless --all-files is set.
+#[test]
+fn check_finds_duplicate_names() {
+    let dir = TmpDir::new("check_dupes");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    fs::create_dir_all(dir.path().join("c")).unwrap();
+    fs::write(dir.path().join("a").join("x.mp4"), b"content-a").unwrap();
+    fs::write(dir.path().join("b").join("x.mp4"), b"content-b-different").unwrap();
+    fs::write(dir.path().join("c").join("unique.mp4"), b"unique").unwrap();
+    // Same-named .txt pair: must NOT be grouped without --all-files.
+    fs::write(dir.path().join("a").join("note.txt"), b"note-a").unwrap();
+    fs::write(dir.path().join("b").join("note.txt"), b"note-b").unwrap();
+
+    let (total, groups) = check::scan_duplicate_groups(dir.path(), false).unwrap();
+    assert_eq!(total, 3, "only the 3 video files should be scanned");
+    assert_eq!(groups.len(), 1, "expected exactly one duplicate-name group (x.mp4)");
+    assert_eq!(groups[0].members.len(), 2);
+
+    let n = check::check(dir.path(), false).unwrap();
+    assert_eq!(n, 1);
+
+    // With --all-files, the note.txt pair becomes a second group.
+    let (total_all, groups_all) = check::scan_duplicate_groups(dir.path(), true).unwrap();
+    assert_eq!(total_all, 5);
+    assert_eq!(groups_all.len(), 2);
+}
+
+/// A directory with no duplicate filenames reports zero groups.
+#[test]
+fn check_clean_dir_returns_zero_groups() {
+    let dir = TmpDir::new("check_clean");
+    fs::write(dir.path().join("a.mp4"), b"aaa").unwrap();
+    fs::write(dir.path().join("b.mp4"), b"bbb").unwrap();
+
+    let (total, groups) = check::scan_duplicate_groups(dir.path(), false).unwrap();
+    assert_eq!(total, 2);
+    assert!(groups.is_empty());
+
+    let n = check::check(dir.path(), false).unwrap();
+    assert_eq!(n, 0);
+}
+
+fn is_16char_uppercase_hex(s: &str) -> bool {
+    s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
+}
+
+/// `rename --only-dupes` with no manifest: only the two same-named files are
+/// planned (hashes computed on the fly); the unique file is absent from the plan
+/// and the orphan scan (which would otherwise flag it) is skipped entirely.
+#[test]
+fn only_dupes_renames_only_collisions() {
+    let dir = TmpDir::new("only_dupes_basic");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    let f1 = dir.path().join("a").join("dup.mp4");
+    let f2 = dir.path().join("b").join("dup.mp4");
+    let f3 = dir.path().join("unique.mp4");
+    fs::write(&f1, b"content-one").unwrap();
+    fs::write(&f2, b"content-two-different").unwrap();
+    fs::write(&f3, b"content-unique").unwrap();
+
+    let op =
+        RenameOperation::new(dir.path().to_path_buf(), None, false, true, false, true).unwrap();
+    let entries = op.load_only_dupes_entries().unwrap();
+    assert_eq!(entries.len(), 2, "only the two same-named files should be collected");
+    for e in &entries {
+        assert!(e.computed, "no manifest present, hash must be computed on the fly");
+        assert!(is_16char_uppercase_hex(&e.hash));
+    }
+
+    let report = op.build_plan(&entries).unwrap();
+    let rename_actions: Vec<_> = report.actions.iter().filter(|a| a.status == "rename").collect();
+    assert_eq!(rename_actions.len(), 2, "exactly the two dupe-group members should be planned");
+
+    let abs_f1 = std::path::absolute(&f1).unwrap();
+    let abs_f2 = std::path::absolute(&f2).unwrap();
+    let abs_f3 = std::path::absolute(&f3).unwrap();
+    let planned_srcs: HashSet<PathBuf> = rename_actions.iter().map(|a| a.src.clone()).collect();
+    assert!(planned_srcs.contains(&abs_f1));
+    assert!(planned_srcs.contains(&abs_f2));
+    assert!(
+        !report.actions.iter().any(|a| a.src == abs_f3),
+        "unique.mp4 must not appear in an --only-dupes plan"
+    );
+    assert!(report.orphans.is_empty(), "orphan scan must be skipped for --only-dupes");
+}
+
+/// `rename --only-dupes` with a manifest covering one group member: that
+/// member's hash comes from the manifest (not recomputed), while the other
+/// (uncovered) member's hash is computed on the fly.
+#[test]
+fn only_dupes_uses_manifest_hash() {
+    let dir = TmpDir::new("only_dupes_manifest");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    let f1 = dir.path().join("a").join("dup.mp4");
+    let f2 = dir.path().join("b").join("dup.mp4");
+    fs::write(&f1, b"content-one").unwrap();
+    fs::write(&f2, b"content-two-different").unwrap();
+
+    let hash1 = rename::hash_file(&f1).unwrap();
+    let hash2 = rename::hash_file(&f2).unwrap();
+
+    let manifest = dir.path().join("m.xxh3");
+    let rel1 = Path::new("a").join("dup.mp4");
+    fs::write(&manifest, format!("{} *{}\r\n", hash1, rel1.to_string_lossy())).unwrap();
+
+    let op = RenameOperation::new(
+        dir.path().to_path_buf(),
+        Some(manifest.clone()),
+        false,
+        true,
+        false,
+        true,
+    )
+    .unwrap();
+    let entries = op.load_only_dupes_entries().unwrap();
+    assert_eq!(entries.len(), 2);
+
+    let abs_f1 = std::path::absolute(&f1).unwrap();
+    let abs_f2 = std::path::absolute(&f2).unwrap();
+
+    let e1 = entries
+        .iter()
+        .find(|e| e.abs_path == abs_f1)
+        .expect("manifest-covered member present");
+    assert_eq!(e1.hash, hash1);
+    assert!(!e1.computed, "manifest-covered entry must not be marked computed");
+
+    let e2 = entries
+        .iter()
+        .find(|e| e.abs_path == abs_f2)
+        .expect("uncovered member present");
+    assert!(e2.computed, "uncovered entry must be computed on the fly");
+    assert_eq!(e2.hash, hash2);
+
+    let report = op.build_plan(&entries).unwrap();
+    let action1 = report.actions.iter().find(|a| a.src == abs_f1).unwrap();
+    assert_eq!(action1.status, "rename");
+    assert_eq!(action1.hash, hash1);
+}
+
+/// A `computed: true` entry must skip re-verification even when its hash is
+/// wrong for the actual content: the hash was just read from disk (--only-dupes
+/// with no manifest), so re-reading a huge file again to "verify" it would be
+/// pointless. This documents the intended semantics.
+#[test]
+fn computed_entry_skips_verify() {
+    let dir = TmpDir::new("computed_skip_verify");
+    let src = dir.path().join("video.mp4");
+    fs::write(&src, b"real content").unwrap();
+
+    let op =
+        RenameOperation::new(dir.path().to_path_buf(), None, true, true, false, false).unwrap();
+    let bad_hash = "0000000000000000";
+    let entries = vec![computed_entry(bad_hash, &src)];
+    let report = op.build_plan(&entries).unwrap();
+
+    assert_eq!(report.actions.len(), 1);
+    let action = &report.actions[0];
+    assert_eq!(
+        action.status, "rename",
+        "computed entries must skip verification even when the hash is wrong"
+    );
+    assert_eq!(action.hash, bad_hash);
+    assert!(action
+        .dst
+        .as_ref()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains(bad_hash));
+}
+
+/// A same-named pair whose filename already carries a hash suffix (`_16HEX`)
+/// and whose sizes match is a benign true copy. `check` must classify it
+/// benign and NOT count it (exit code stays 0).
+#[test]
+fn check_hash_suffixed_pair_is_benign() {
+    let dir = TmpDir::new("check_benign");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    // Same content in both dirs, already suffixed with the (shared) hash.
+    fs::write(dir.path().join("a").join("x_00AABBCCDDEEFF11.mp4"), b"same").unwrap();
+    fs::write(dir.path().join("b").join("x_00AABBCCDDEEFF11.mp4"), b"same").unwrap();
+
+    let (total, groups) = check::scan_duplicate_groups(dir.path(), false).unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0].benign, "hash-suffixed same-name pair must be classified benign");
+
+    let n = check::check(dir.path(), false).unwrap();
+    assert_eq!(n, 0, "benign groups must not count toward the real-collision total");
+}
+
+/// Mixed tree: one real (un-suffixed) collision plus one benign hash-suffixed
+/// pair — only the real one counts.
+#[test]
+fn check_mixed_real_and_benign_groups() {
+    let dir = TmpDir::new("check_mixed");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    // Real collision: same name, no hash suffix, different content.
+    fs::write(dir.path().join("a").join("clip.mp4"), b"one").unwrap();
+    fs::write(dir.path().join("b").join("clip.mp4"), b"two-different").unwrap();
+    // Benign pair: name already carries the shared hash suffix.
+    fs::write(dir.path().join("a").join("intro_0873784776488DB8.mov"), b"same").unwrap();
+    fs::write(dir.path().join("b").join("intro_0873784776488DB8.mov"), b"same").unwrap();
+
+    let (_, groups) = check::scan_duplicate_groups(dir.path(), false).unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups.iter().filter(|g| g.benign).count(), 1);
+    assert_eq!(groups.iter().filter(|g| !g.benign).count(), 1);
+
+    let n = check::check(dir.path(), false).unwrap();
+    assert_eq!(n, 1, "only the real (un-suffixed) collision counts");
+}
+
+/// `rename --only-dupes` on a tree containing only a benign hash-suffixed pair
+/// must produce no entries at all — in particular it must not re-hash the
+/// (potentially huge) true-copy files on every re-run.
+#[test]
+fn only_dupes_skips_benign_groups() {
+    let dir = TmpDir::new("only_dupes_benign");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    fs::write(dir.path().join("a").join("x_00AABBCCDDEEFF11.mp4"), b"same").unwrap();
+    fs::write(dir.path().join("b").join("x_00AABBCCDDEEFF11.mp4"), b"same").unwrap();
+
+    let op =
+        RenameOperation::new(dir.path().to_path_buf(), None, false, true, false, true).unwrap();
+    let entries = op.load_only_dupes_entries().unwrap();
+    assert!(
+        entries.is_empty(),
+        "benign groups must be skipped entirely (no hashing, no plan entries)"
+    );
+}
+
+/// A name whose "hash" suffix is really a camera timestamp (16 decimal digits
+/// are valid hex!) must NOT be classified benign when the members' sizes
+/// differ — that is a real, dangerous collision, not a true copy. Benign
+/// requires BOTH the hash-shaped suffix AND equal sizes.
+#[test]
+fn timestamp_named_collision_not_benign() {
+    let dir = TmpDir::new("check_timestamp");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    // 16 decimal digits (YYYYMMDDHHMMSSff) — hex-shaped, but different content
+    // AND different sizes: a genuine collision hiding behind a hash-like name.
+    fs::write(dir.path().join("a").join("x_2026070212345678.mp4"), b"short").unwrap();
+    fs::write(
+        dir.path().join("b").join("x_2026070212345678.mp4"),
+        b"much longer different content",
+    )
+    .unwrap();
+
+    let (_, groups) = check::scan_duplicate_groups(dir.path(), false).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert!(
+        !groups[0].benign,
+        "hash-shaped name with differing sizes must NOT be benign"
+    );
+
+    let n = check::check(dir.path(), false).unwrap();
+    assert_eq!(n, 1, "the pair must count as a real collision");
+
+    // And --only-dupes must include (not skip) the pair.
+    let op =
+        RenameOperation::new(dir.path().to_path_buf(), None, false, true, false, true).unwrap();
+    let entries = op.load_only_dupes_entries().unwrap();
+    assert_eq!(entries.len(), 2, "differing-size pair must be planned, not skipped");
+}
+
+/// Conversely, a hash-suffixed pair with EQUAL sizes stays benign.
+#[test]
+fn equal_size_hash_suffixed_pair_stays_benign() {
+    let dir = TmpDir::new("check_benign_eqsize");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    fs::write(dir.path().join("a").join("y_0873784776488DB8.mov"), b"copy-content").unwrap();
+    fs::write(dir.path().join("b").join("y_0873784776488DB8.mov"), b"copy-content").unwrap();
+
+    let (_, groups) = check::scan_duplicate_groups(dir.path(), false).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0].benign, "equal-size hash-suffixed pair must stay benign");
+    assert_eq!(check::check(dir.path(), false).unwrap(), 0);
+}
+
+/// `has_hash_suffix` recognizes `_16HEX` stems without knowing the hash, and
+/// rejects near-misses.
+#[test]
+fn has_hash_suffix_detection() {
+    use dups::rename::has_hash_suffix;
+    assert!(has_hash_suffix(Path::new("x_00AABBCCDDEEFF11.mp4")));
+    assert!(has_hash_suffix(Path::new("x_00aabbccddeeff11.mp4"))); // lowercase hex
+    assert!(has_hash_suffix(Path::new("dir/intro_0873784776488DB8.mov")));
+    assert!(!has_hash_suffix(Path::new("x.mp4"))); // no suffix
+    assert!(!has_hash_suffix(Path::new("x_00AABBCCDDEEFF1.mp4"))); // 15 hex
+    assert!(!has_hash_suffix(Path::new("x_00AABBCCDDEEFFGG.mp4"))); // non-hex
+    assert!(!has_hash_suffix(Path::new("x-00AABBCCDDEEFF11.mp4"))); // no underscore
+    assert!(!has_hash_suffix(Path::new("0AABBCCDDEEFF11.mp4"))); // stem too short
+}
+
+/// CLI-level: bare `dups <PATH>` is an alias for `dups check <PATH>` — it
+/// prints the duplicate-name report and exits 1 when collisions are found, 0
+/// on a clean directory.
+#[test]
+fn cli_bare_path_check_alias() {
+    let bin = env!("CARGO_BIN_EXE_dups");
+
+    let dir = TmpDir::new("cli_dupe");
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    fs::write(dir.path().join("a").join("dup.mp4"), b"one").unwrap();
+    fs::write(dir.path().join("b").join("dup.mp4"), b"two").unwrap();
+
+    let output = std::process::Command::new(bin)
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("重名"),
+        "stdout should mention 重名 (duplicate names), got: {stdout}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+
+    let dir2 = TmpDir::new("cli_clean");
+    fs::write(dir2.path().join("a.mp4"), b"aaa").unwrap();
+    fs::write(dir2.path().join("b.mp4"), b"bbb").unwrap();
+
+    let output2 = std::process::Command::new(bin)
+        .arg(dir2.path())
+        .output()
+        .unwrap();
+    assert_eq!(output2.status.code(), Some(0));
 }
