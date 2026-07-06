@@ -26,10 +26,12 @@ Our solution: append a 16-character xxHash3-64 hash value to the filename. Since
 
 Get the latest releases from [GitHub Releases](https://github.com/geekshootjack/dups-rs/releases)
 
-- `dups-windows-x86_64.exe` — Windows
-- `dups-macos-x86_64` — macOS Intel
-- `dups-macos-aarch64` — macOS Apple Silicon
-- `dups-linux-x86_64` — Linux
+Artifacts are named `dups-<version>-<target-triple>`:
+
+- `dups-vX.Y.Z-x86_64-pc-windows-gnu.zip` — Windows
+- `dups-vX.Y.Z-x86_64-apple-darwin.tar.gz` — macOS Intel
+- `dups-vX.Y.Z-aarch64-apple-darwin.tar.gz` — macOS Apple Silicon
+- `dups-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` — Linux
 
 ### Build from source
 
